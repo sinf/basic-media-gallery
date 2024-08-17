@@ -1,0 +1,7 @@
+cache
+www
+__pycache__
+*.swo
+*.swp
+*~
+
