@@ -32,3 +32,8 @@ basic-media-gallery.py: the main program
 some file .db: database of thumbnails  
 some directory: directory tree containing media files  
 
+# Screenshots
+
+![index](./readme/index.png)  
+![page](./readme/page.png)  
+
