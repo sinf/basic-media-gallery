@@ -28,7 +28,7 @@ sh run.sh
 
 # Structure
 
-basic-media-gallery.py: the main program
-some file .db: database of thumbnails
-some directory: directory tree containing media files
+basic-media-gallery.py: the main program  
+some file .db: database of thumbnails  
+some directory: directory tree containing media files  
 
