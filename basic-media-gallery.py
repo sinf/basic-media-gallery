@@ -8,14 +8,13 @@ import argparse
 import sqlite3
 import mimetypes
 import hashlib
+import time
 from PIL import Image
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 
 def wrap_cdata(x):
-  # crappy basic hack to fix filenames turning into html
-  x=''.join(c if c.isalnum() or c in './-() ' else '%' for c in x)
-  return x
-  #return f'<![CDATA[{x}]]>'
+  # fix filenames turning into html, in case someone creates a file named <script>
+  return ''.join(c if c.isalnum() or c in './-() ' else '' for c in x)
 
 def hazh(x):
   return hashlib.sha256(x.encode()).digest().hex()
@@ -26,13 +25,11 @@ class ContentItem:
     self.abspath = os.path.realpath(relpath)
     self.key = hazh(relpath.lstrip('.').lstrip('/'))
     self.pageid = hazh(os.path.dirname(relpath))
-    t,_ = mimetypes.guess_type(self.relpath)
-    if not t.startswith('image/') and not t.startswith('video'):
-      t=None
-    self.mimetype = t
+    self.mimetype, _ = mimetypes.guess_type(self.relpath)
 
-  def is_media(self):
-    return self.mimetype is not None
+  def is_supported(self):
+    t=self.mimetype
+    return t and (t.startswith('image/') or t.startswith('video'))
 
   def page_name(self):
     p = os.path.dirname(self.relpath)
@@ -50,7 +47,8 @@ class ContentItem:
   def thumbnabularize(self):
     buf = io.BytesIO()
     with Image.open(self.abspath) as img:
-      thumb = img.resize((64,64))
+      #thumb = img.resize((64,64))
+      img.thumbnail((64,64)); thumb=img
       thumb.save(buf, format='JPEG')
     buf.seek(0)
     data = buf.read()
@@ -67,7 +65,10 @@ class ContentItem:
         traceback.print_exc()
         return bad('error')
       b = base64.b64encode(data).decode('ascii')
-      return f'<div><a href="/view/{self.key}"><img src="data:image/jpeg;base64,{b}"/></a><p class="label">{name}</p></div>'
+      img = f'<img src="data:image/jpeg;base64,{b}"/>'
+      label = f'<p class="label">{name}</p>'
+      #mt = f'<p class="mtime">{time.ctime(self.get_mtime())}</p>'
+      return f'<a href="/view/{self.key}"><div>{img}{label}</div></a>'
     return bad('unsupported type')
 
 class DbCache:
@@ -122,22 +123,24 @@ class Gallery:
     itemsk = {}
     items = {}
     pagenam = {}
+    self.page_mt = {}
     for root, dirs, files in os.walk(self.rootdir, topdown=True, followlinks=False):
       dirs[:] = sorted(dirs)
       for f in sorted(files):
         relpath = os.path.join(root, f)
         item = ContentItem(relpath)
-        if item.is_media():
+        if item.is_supported():
           p = item.pageid
           print(item.key, p, relpath)
           itemsk[item.key] = item
           items[p] = items.get(p,[]) + [item]
           pagenam[p] = wrap_cdata(item.page_name())
           self.cache.getput(item.key, item.get_mtime(), item.html)
+          self.page_mt[p] = max(self.page_mt.get(p,float('-inf')), item.get_mtime())
     self.items_by_pageid = items
     self.items_by_key = itemsk
-    # reverse sorted so if directory is date, the latest appear first
-    self.sorted_pageid = [xx[0] for xx in reversed(sorted(pagenam.items(), key=lambda x:x[1]))]
+    # sorted so the latest modified appear first
+    self.sorted_pageid = sorted(items.keys(), key=lambda k: -self.page_mt[k])
     self.page_name_by_id = pagenam
 
   def _header(self):
@@ -150,14 +153,14 @@ html { background: black; }
 * { color: white; }
 .pageitem { float:left; display:inline-block; margin:0.5em; }
 .pageitem img { width: 10em; border: 1px solid white; }
+.pageitem p { margin: 0.1em 0.1em 0 0.1em; }
 .label { max-width: 10em; }
 </style>
 </head>
 <body>'''
     h+='<a href="/">index</a><br/>'
     if self.sorted_pageid:
-      p=self.sorted_pageid[-1]
-      h+=f'<a href="/page/{p}">most recent</a><br/>'
+      h+=f'<a href="/page/{self.sorted_pageid[0]}">most recent</a><br/>'
     return h
 
   def _footer(self):
@@ -183,13 +186,18 @@ html { background: black; }
     if cur > 0:
       prev=f'/page/{self.sorted_pageid[cur-1]}'
       h+=f'<a href="{prev}">previous page</a><br/>'
+    else:
+      h+=f'no previous page<br/>'
     if cur < len(self.sorted_pageid)-1:
       Next=f'/page/{self.sorted_pageid[cur+1]}'
       h+=f'<a href="{Next}">next page</a><br/>'
+    else:
+      h+=f'no next page<br/>'
     nam = self.page_name_by_id[pageid]
-    h+=f'<p>This page: {nam}</p>'
+    h+=f'<p>This page: {nam} , {time.ctime(self.page_mt[pageid])} , {len(self.items_by_pageid[pageid])} items</p>'
     h+='<ol>'
-    for item in self.items_by_pageid[pageid]:
+    mi = [(it,it.get_mtime()) for it in self.items_by_pageid[pageid]]
+    for item, mt in sorted(mi, key=lambda x: -x[1]):
       h += '<li class="pageitem">'
       h += self.cache.getput(item.key, item.get_mtime(), item.html)
       h += '</li>'
@@ -231,15 +239,15 @@ class CustomHandler(SimpleHTTPRequestHandler):
 
 def run():
   arp = argparse.ArgumentParser()
-  arp.add_argument('-l', '--listen-addr', default='0.0.0.0')
-  arp.add_argument('-p', '--port', type=int, default=3000)
+  arp.add_argument('-l', '--listen-addr', default='127.0.0.1', help='[127.0.0.1]')
+  arp.add_argument('-p', '--port', type=int, default=3000, help='[3000]')
   arp.add_argument('-r', '--root-dir', type=str, required=True)
   arp.add_argument('-d', '--db-path', type=str, required=True)
   args=arp.parse_args()
   server_address = (args.listen_addr, args.port)
   global the_gallery
-  os.chdir(args.root_dir)
   the_gallery = Gallery('.', args.db_path)
+  os.chdir(args.root_dir)
   the_gallery.scan()
   print('Root dir', args.root_dir)
   print('Database', args.db_path)
