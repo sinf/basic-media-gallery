@@ -105,9 +105,9 @@ ON CONFLICT(key) DO UPDATE SET data=excluded.data, mtime=excluded.mtime
     result = self.get(key)
     if result is not None:
       data, mtime = result
-      print('read cached', key, mtime)
+      #print('read cached', key, mtime)
     if result is None or int(mtime) != int(mtime_should_be):
-      print('generate new', key, mtime_should_be)
+      #print('generate new', key, mtime_should_be)
       mtime = int(mtime_should_be)
       data = make_data()
       self.put(key, data, mtime)
@@ -131,7 +131,7 @@ class Gallery:
         item = ContentItem(relpath)
         if item.is_supported():
           p = item.pageid
-          print(item.key, p, relpath)
+          print(relpath)
           itemsk[item.key] = item
           items[p] = items.get(p,[]) + [item]
           pagenam[p] = wrap_cdata(item.page_name())
@@ -230,7 +230,6 @@ class CustomHandler(SimpleHTTPRequestHandler):
         p = the_gallery.index()
         self._ok('text/html', p.encode())
       else:
-        #super().do_GET()
         print('not found', self.path)
         self.send_error(404, 'Page not found')
     except Exception as ex:
