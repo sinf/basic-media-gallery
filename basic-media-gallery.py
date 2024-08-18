@@ -6,34 +6,50 @@ import io
 import base64
 import argparse
 import sqlite3
+import mimetypes
+import hashlib
 from PIL import Image
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 
+def wrap_cdata(x):
+  # crappy basic hack to fix filenames turning into html
+  x=''.join(c if c.isalnum() or c in './-() ' else '%' for c in x)
+  return x
+  #return f'<![CDATA[{x}]]>'
+
+def hazh(x):
+  return hashlib.sha256(x.encode()).digest().hex()
+
 class ContentItem:
-  def __init__(self, path):
-    self.path = os.path.realpath(path)
-    self.key = path
-    self.pageid = os.path.dirname(path)
+  def __init__(self, relpath):
+    self.relpath = relpath
+    self.abspath = os.path.realpath(relpath)
+    self.key = hazh(relpath.lstrip('.').lstrip('/'))
+    self.pageid = hazh(os.path.dirname(relpath))
+    t,_ = mimetypes.guess_type(self.relpath)
+    if not t.startswith('image/') and not t.startswith('video'):
+      t=None
+    self.mimetype = t
+
+  def is_media(self):
+    return self.mimetype is not None
+
+  def page_name(self):
+    p = os.path.dirname(self.relpath)
+    if p == '' or p == '.':
+      p='(root)'
+    return p
 
   def get_mtime(self):
-    return int(os.stat(self.path).st_mtime)
-
-  def mimetyp(self):
-    p=self.path.lower()
-    if p.endswith('.jpg'):
-      return 'image/jpeg'
-    elif p.endswith('.png'):
-      return 'image/png'
-    else:
-      return None
+    return int(os.stat(self.abspath).st_mtime)
 
   def read(self):
-    with open(self.path,'rb') as f:
+    with open(self.abspath,'rb') as f:
       return f.read()
 
   def thumbnabularize(self):
     buf = io.BytesIO()
-    with Image.open(self.path) as img:
+    with Image.open(self.abspath) as img:
       thumb = img.resize((64,64))
       thumb.save(buf, format='JPEG')
     buf.seek(0)
@@ -41,10 +57,18 @@ class ContentItem:
     return data
 
   def html(self):
-    data = self.thumbnabularize()
-    b = base64.b64encode(data).decode('ascii')
-    name = os.path.basename(self.path)
-    return f'<div><a href="/view/{self.key}"><img src="data:image/jpeg;base64,{b}"/></a><p class="label">{name}</p></div>'
+    name = wrap_cdata(os.path.basename(self.relpath))
+    bad = lambda msg: f'<div><img src="/favicon.ico"/><p class="label">{name} ({msg})</p></div>'
+    t = self.mimetype
+    if t.startswith('image/'):
+      try:
+        data = self.thumbnabularize()
+      except Exception as ex:
+        traceback.print_exc()
+        return bad('error')
+      b = base64.b64encode(data).decode('ascii')
+      return f'<div><a href="/view/{self.key}"><img src="data:image/jpeg;base64,{b}"/></a><p class="label">{name}</p></div>'
+    return bad('unsupported type')
 
 class DbCache:
   def __init__(self, dbpath):
@@ -88,10 +112,6 @@ ON CONFLICT(key) DO UPDATE SET data=excluded.data, mtime=excluded.mtime
       self.put(key, data, mtime)
     return data
 
-def is_media(path):
-  i=ContentItem(path)
-  return i.mimetyp() is not None
-
 class Gallery:
   def __init__(self, rootdir, dbpath):
     self.rootdir = rootdir
@@ -101,20 +121,24 @@ class Gallery:
     print('scanning files..')
     itemsk = {}
     items = {}
+    pagenam = {}
     for root, dirs, files in os.walk(self.rootdir, topdown=True, followlinks=False):
       dirs[:] = sorted(dirs)
       for f in sorted(files):
-        path = os.path.join(root, f)
-        if is_media(path):
-          item = ContentItem(path)
+        relpath = os.path.join(root, f)
+        item = ContentItem(relpath)
+        if item.is_media():
           p = item.pageid
-          print(item.key, p, path)
+          print(item.key, p, relpath)
           itemsk[item.key] = item
           items[p] = items.get(p,[]) + [item]
+          pagenam[p] = wrap_cdata(item.page_name())
           self.cache.getput(item.key, item.get_mtime(), item.html)
     self.items_by_pageid = items
     self.items_by_key = itemsk
-    self.sorted_pageid = sorted(items.keys())
+    # reverse sorted so if directory is date, the latest appear first
+    self.sorted_pageid = [xx[0] for xx in reversed(sorted(pagenam.items(), key=lambda x:x[1]))]
+    self.page_name_by_id = pagenam
 
   def _header(self):
     h='''<!DOCTYPE html>
@@ -140,16 +164,20 @@ html { background: black; }
     return '''</body></html>'''
 
   def index(self):
+    self.scan()
     h=self._header()
     h+='<ol>'
     for p in self.sorted_pageid:
-      h += f'<li><a href="/page/{p}">{p}</a></li>'
+      nam = self.page_name_by_id[p]
+      h += f'<li><a href="/page/{p}">{nam}</a></li>'
     h += '</ol>'
     h+=self._footer()
     return h
 
   def page(self, pageid):
     self.scan()
+    if pageid not in self.sorted_pageid:
+      return self._header() + '<h1>page not found</h1>' + self._footer()
     h=self._header()
     cur = self.sorted_pageid.index(pageid)
     if cur > 0:
@@ -158,7 +186,8 @@ html { background: black; }
     if cur < len(self.sorted_pageid)-1:
       Next=f'/page/{self.sorted_pageid[cur+1]}'
       h+=f'<a href="{Next}">next page</a><br/>'
-    h+=f'<p>This page: {pageid}</p>'
+    nam = self.page_name_by_id[pageid]
+    h+=f'<p>This page: {nam}</p>'
     h+='<ol>'
     for item in self.items_by_pageid[pageid]:
       h += '<li class="pageitem">'
@@ -182,17 +211,13 @@ class CustomHandler(SimpleHTTPRequestHandler):
       if self.path == '/favicon.ico':
         return self._ok('image/x-icon', b'\x00\x00\x01\x00\x01\x00  \x10\x00\x01\x00\x04\x00\xe8\x02\x00\x00\x16\x00\x00\x00(\x00\x00\x00 \x00\x00\x00@\x00\x00\x00\x01\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1e!\x1f\x00142\x00ADB\x00OQO\x00dge\x00sus\x00\x81\x84\x82\x00\x8e\x91\x8f\x00\x9c\x9f\x9d\x00\xac\xb0\xad\x00\xbe\xc2\xbf\x00\xca\xce\xcb\x00\xda\xdd\xdb\x00\xee\xf1\xef\x00\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xdau1$h\xac\xdf\xff\xff\xff\xff\xff\xff\xff\xff\xb3\x00\x00\x00\x00\x00\x00\x04\x9f\xff\xff\xff\xff\xff\xff\xe4\x00\x00\x00\x00\x00\x00\x00\x00\x0e\xff\xff\xff\xff\xff\xfd \x00\x00\x00\x00\x00\x00\x00\x00\x0e\xff\xff\xff\xff\xff\xe3\x00\x00\x00\x02gv \x00\x00\x0e\xff\xff\xff\xff\xffp\x00\x00\x06\xcf\xff\xff\xf9\x00\x00\x0e\xff\xff\xff\xff\xfd\x00\x00\x00\x7f\xff\xff\xff\xf9\x00\x00\x0e\xff\xff\xff\xff\xf9\x00\x00\x04\xff\xff\xff\xff\xf9\x00\x00\x0e\xff\xff\xff\xff\xf1\x00\x00\x0b\xff\xff\xff\xff\xf9\x00\x00\x0e\xff\xff\xff\xff\xd0\x00\x00/\xff\xff\xff\xff\xf9\x00\x00\x0e\xff\xff\xff\xff\xb0\x00\x00\x7f\xff\xff\xff\xff\xf9\x00\x00\x0e\xff\xff\xff\xff\xa0\x00\x00\xbf\xff\xff\x88\x88\x84\x00\x00\x0e\xff\xff\xff\xff\x90\x00\x00\xbf\xff\xff@\x00\x00\x00\x00\x0e\xff\xff\xff\xff\x80\x00\x00\xcf\xff\xff@\x00\x00\x00\x00\x0e\xff\xff\xff\xff\x80\x00\x00\xcf\xff\xff@\x00\x00\x00\x00\x0e\xff\xff\xff\xff\x90\x00\x00\xbf\xff\xff@\x00\x00\x00\x00\x0e\xff\xff\xff\xff\xa0\x00\x00\xaf\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xc0\x00\x00_\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xe0\x00\x00\r\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf5\x00\x00\x07\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfb\x00\x00\x00\xbf\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xfe@\x00\x00\n\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xc0\x00\x00\x00}\xef\xff\xff\xdaK\xff\xff\xff\xff\xff\xff\xfa\x00\x00\x00\x00&\x87Q\x00\x05\xff\xff\xff\xff\xff\xff\xff\xa0\x00\x00\x00\x00\x00\x00\x00\x00\xdf\xff\xff\xff\xff\xff\xff\xfc0\x00\x00\x00\x00\x00\x00\x00\x8f\xff\xff\xff\xff\xff\xff\xff\xea0\x00\x00\x00\x00\x00\x05\xaf\xff\xff\xff\xff\xff\xff\xff\xff\xfd\xa8S\x12F\x9b\xef\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
       elif self.path.startswith('/page/'):
-        pageid = self.path[6:]
-        if pageid == '':
-          pageid = '.'
+        pageid = self.path[6:].replace('/','').replace('.','')
         p = the_gallery.page(pageid)
         self._ok('text/html', p.encode())
       elif self.path.startswith('/view/'):
-        itemid = self.path[6:]
-        if os.path.dirname(itemid) == '':
-          itemid = './'+itemid
+        itemid = self.path[6:].replace('/','').replace('.','')
         item = the_gallery.items_by_key[itemid]
-        self._ok(item.mimetyp(), item.read())
+        self._ok(item.mimetype, item.read())
       elif self.path == '/':
         p = the_gallery.index()
         self._ok('text/html', p.encode())
